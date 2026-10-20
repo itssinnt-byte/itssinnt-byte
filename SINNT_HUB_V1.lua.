@@ -1,0 +1,776 @@
+
+--[[
+    SINNT HUB V1 | Standalone Luau / mobile UI
+    Target: Roblox client, tested by static inspection only (not run in Delta).
+    Designed around Roblox APIs; no key, no expiry, no remote code.
+    Does NOT alter, patch, or remove Delta executor's own licensing.
+    Features are client-side and may be limited by server validation.
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Lighting = game:GetService("Lighting")
+local HttpService = game:GetService("HttpService")
+local Workspace = game:GetService("Workspace")
+local player = Players.LocalPlayer
+if not player then return end
+
+local env = _G
+if type(getgenv) == "function" then
+    local ok, value = pcall(getgenv)
+    if ok and type(value) == "table" then env = value end
+end
+if env.SINNT_HUB_V1 and type(env.SINNT_HUB_V1.Destroy) == "function" then
+    pcall(env.SINNT_HUB_V1.Destroy)
+end
+
+local guiName = "SINNT_HUB_V1_GUI"
+local playerGui = player:WaitForChild("PlayerGui")
+local oldGui = playerGui:FindFirstChild(guiName)
+if oldGui then oldGui:Destroy() end
+
+local alive = true
+local connections = {}
+local pageConnections = {}
+local function trackPage(conn)
+    table.insert(pageConnections, conn)
+    return conn
+end
+local function track(conn)
+    table.insert(connections, conn)
+    return conn
+end
+local state = {
+    speed = false,
+    jump = false,
+    noclip = false,
+    infiniteJump = false,
+    playerESP = false,
+    eggESP = false,
+    antiAFK = false,
+    fpsSaver = false,
+}
+local configFile = "SINNT_HUB_V1_SETTINGS.json"
+local function loadSettings()
+    if type(isfile) ~= "function" or type(readfile) ~= "function" then return end
+    local ok, content = pcall(function()
+        if isfile(configFile) then return readfile(configFile) end
+    end)
+    if not ok or type(content) ~= "string" then return end
+    local decoded, data = pcall(function() return HttpService:JSONDecode(content) end)
+    if not decoded or type(data) ~= "table" then return end
+    for key in pairs(state) do
+        if type(data[key]) == "boolean" then state[key] = data[key] end
+    end
+end
+local function saveSettings()
+    if type(writefile) ~= "function" then return end
+    pcall(function() writefile(configFile, HttpService:JSONEncode(state)) end)
+end
+loadSettings()
+
+-- Restore only properties actually changed by this hub.
+local humanoidDefaults = setmetatable({}, {__mode = "k"})
+local collisions = setmetatable({}, {__mode = "k"})
+local visuals = setmetatable({}, {__mode = "k"})
+local playerVisuals = {}
+local eggVisuals = {}
+local MAX_EGG_MARKERS = 60
+
+local function character()
+    return player.Character
+end
+local function humanoid()
+    local ch = character()
+    return ch and ch:FindFirstChildOfClass("Humanoid")
+end
+local function rootPart()
+    local ch = character()
+    return ch and ch:FindFirstChild("HumanoidRootPart")
+end
+local function cacheHumanoid(h)
+    if not h then return end
+    if not humanoidDefaults[h] then
+        humanoidDefaults[h] = {
+            WalkSpeed = h.WalkSpeed,
+            JumpPower = h.JumpPower,
+            JumpHeight = h.JumpHeight,
+            UseJumpPower = h.UseJumpPower,
+        }
+    end
+end
+local function applyMovement()
+    local h = humanoid()
+    if not h then return end
+    cacheHumanoid(h)
+    local orig = humanoidDefaults[h]
+    pcall(function()
+        h.WalkSpeed = state.speed and 32 or orig.WalkSpeed
+        if state.jump then
+            h.UseJumpPower = true
+            h.JumpPower = 85
+        else
+            h.UseJumpPower = orig.UseJumpPower
+            h.JumpPower = orig.JumpPower
+            h.JumpHeight = orig.JumpHeight
+        end
+    end)
+end
+local function restoreCollisions()
+    for part, original in pairs(collisions) do
+        if part and part.Parent then
+            pcall(function() part.CanCollide = original end)
+        end
+        collisions[part] = nil
+    end
+end
+local function applyNoclip()
+    local ch = character()
+    if not ch then return end
+    for _, item in ipairs(ch:GetDescendants()) do
+        if item:IsA("BasePart") then
+            if collisions[item] == nil then collisions[item] = item.CanCollide end
+            if item.CanCollide then item.CanCollide = false end
+        end
+    end
+end
+
+local function restoreVisuals()
+    for obj, props in pairs(visuals) do
+        if obj and obj.Parent then
+            for key, value in pairs(props) do
+                pcall(function() obj[key] = value end)
+            end
+        end
+        visuals[obj] = nil
+    end
+end
+local function setVisual(obj, prop, value)
+    local previous = visuals[obj]
+    if not previous then
+        previous = {}
+        visuals[obj] = previous
+    end
+    if previous[prop] == nil then
+        local ok, old = pcall(function() return obj[prop] end)
+        if ok then previous[prop] = old end
+    end
+    pcall(function() obj[prop] = value end)
+end
+local function applyFpsSaver()
+    if not state.fpsSaver then restoreVisuals() return end
+    setVisual(Lighting, "GlobalShadows", false)
+    for _, item in ipairs(Lighting:GetChildren()) do
+        if item:IsA("BloomEffect") or item:IsA("BlurEffect") or
+           item:IsA("SunRaysEffect") or item:IsA("DepthOfFieldEffect") then
+            setVisual(item, "Enabled", false)
+        end
+    end
+    for _, item in ipairs(Workspace:GetDescendants()) do
+        if item:IsA("ParticleEmitter") or item:IsA("Trail") or item:IsA("Beam") then
+            setVisual(item, "Enabled", false)
+        end
+    end
+end
+
+local function deletePlayerVisual(plr)
+    local objects = playerVisuals[plr]
+    if not objects then return end
+    for _, object in ipairs(objects) do
+        if object and object.Parent then object:Destroy() end
+    end
+    playerVisuals[plr] = nil
+end
+local function addPlayerVisual(plr)
+    if not alive or not state.playerESP or plr == player then return end
+    local ch = plr.Character
+    if not ch then return end
+    local head = ch:FindFirstChild("Head")
+    if not head then return end
+    deletePlayerVisual(plr)
+    local hl = Instance.new("Highlight")
+    hl.Name = "SinntPlayerMarker"
+    hl.Adornee = ch
+    hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    hl.FillColor = Color3.fromRGB(72, 166, 255)
+    hl.FillTransparency = 0.75
+    hl.OutlineColor = Color3.fromRGB(160, 218, 255)
+    hl.Parent = ch
+    local labelGui = Instance.new("BillboardGui")
+    labelGui.Name = "SinntPlayerLabel"
+    labelGui.Size = UDim2.new(0, 180, 0, 28)
+    labelGui.StudsOffsetWorldSpace = Vector3.new(0, 2.8, 0)
+    labelGui.AlwaysOnTop = true
+    labelGui.Adornee = head
+    labelGui.Parent = head
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, 0, 1, 0)
+    label.BackgroundTransparency = 1
+    label.TextColor3 = Color3.fromRGB(230, 244, 255)
+    label.TextStrokeTransparency = 0.3
+    label.TextScaled = true
+    label.Font = Enum.Font.GothamBold
+    label.Text = plr.DisplayName
+    label.Parent = labelGui
+    playerVisuals[plr] = {hl, labelGui, label}
+end
+local function refreshPlayerVisuals()
+    for plr in pairs(playerVisuals) do deletePlayerVisual(plr) end
+    if state.playerESP then
+        for _, plr in ipairs(Players:GetPlayers()) do addPlayerVisual(plr) end
+    end
+end
+
+local function eggNamed(inst)
+    if not (inst:IsA("Model") or inst:IsA("BasePart")) then return false end
+    local name = string.lower(inst.Name)
+    if not (name:find("egg", 1, true) or name:find("telur", 1, true)) then
+        return false
+    end
+    if inst:IsDescendantOf(player.Character or Workspace.Terrain) then return false end
+    local parent = inst.Parent
+    while parent and parent ~= Workspace do
+        if (parent:IsA("Model") or parent:IsA("BasePart")) then
+            local pname = string.lower(parent.Name)
+            if pname:find("egg", 1, true) or pname:find("telur", 1, true) then
+                return false
+            end
+        end
+        parent = parent.Parent
+    end
+    return true
+end
+local function getTargetPart(inst)
+    if not inst or not inst.Parent then return nil end
+    if inst:IsA("BasePart") then return inst end
+    if inst:IsA("Model") then
+        return inst.PrimaryPart or inst:FindFirstChildWhichIsA("BasePart", true)
+    end
+    return nil
+end
+local function destroyEggVisual(inst)
+    local objects = eggVisuals[inst]
+    if not objects then return end
+    for _, obj in ipairs(objects) do
+        if obj and obj.Parent then obj:Destroy() end
+    end
+    eggVisuals[inst] = nil
+end
+local function eggCount()
+    local count = 0
+    for inst in pairs(eggVisuals) do
+        if inst and inst:IsDescendantOf(Workspace) then
+            count = count + 1
+        else
+            destroyEggVisual(inst)
+        end
+    end
+    return count
+end
+local function addEggVisual(inst)
+    if not alive or not state.eggESP or eggVisuals[inst] or not eggNamed(inst) then return end
+    if eggCount() >= MAX_EGG_MARKERS then return end
+    local part = getTargetPart(inst)
+    if not part then return end
+    local hl = Instance.new("Highlight")
+    hl.Name = "SinntEggMarker"
+    hl.Adornee = inst
+    hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    hl.FillColor = Color3.fromRGB(255, 182, 48)
+    hl.FillTransparency = 0.67
+    hl.OutlineColor = Color3.fromRGB(255, 223, 124)
+    hl.Parent = inst
+    local bill = Instance.new("BillboardGui")
+    bill.Name = "SinntEggLabel"
+    bill.Size = UDim2.new(0, 155, 0, 24)
+    bill.StudsOffsetWorldSpace = Vector3.new(0, 2.4, 0)
+    bill.AlwaysOnTop = true
+    bill.Adornee = part
+    bill.Parent = part
+    local textLabel = Instance.new("TextLabel")
+    textLabel.Size = UDim2.new(1, 0, 1, 0)
+    textLabel.BackgroundTransparency = 1
+    textLabel.Font = Enum.Font.GothamBold
+    textLabel.TextScaled = true
+    textLabel.TextStrokeTransparency = 0.25
+    textLabel.TextColor3 = Color3.fromRGB(255, 216, 110)
+    textLabel.Text = inst.Name
+    textLabel.Parent = bill
+    eggVisuals[inst] = {hl, bill}
+end
+local function clearEggVisuals()
+    for inst in pairs(eggVisuals) do destroyEggVisual(inst) end
+end
+local eggScanToken = 0
+local function refreshEggVisuals()
+    eggScanToken = eggScanToken + 1
+    local token = eggScanToken
+    clearEggVisuals()
+    if not state.eggESP then return end
+    task.spawn(function()
+        for i, inst in ipairs(Workspace:GetDescendants()) do
+            if not alive or token ~= eggScanToken or not state.eggESP then return end
+            if eggNamed(inst) then addEggVisual(inst) end
+            if i % 300 == 0 then task.wait() end
+        end
+    end)
+end
+local function findNearestEgg()
+    local root = rootPart()
+    if not root then return nil, nil end
+    local chosen, chosenPart
+    local nearest = math.huge
+    for _, inst in ipairs(Workspace:GetDescendants()) do
+        if eggNamed(inst) then
+            local part = getTargetPart(inst)
+            if part then
+                local distance = (part.Position - root.Position).Magnitude
+                if distance < nearest then
+                    nearest, chosen, chosenPart = distance, inst, part
+                end
+            end
+        end
+    end
+    return chosen, chosenPart
+end
+
+local mainGui = Instance.new("ScreenGui")
+mainGui.Name = guiName
+mainGui.DisplayOrder = 950
+mainGui.ResetOnSpawn = false
+mainGui.IgnoreGuiInset = true
+mainGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+mainGui.Parent = playerGui
+local BG = Color3.fromRGB(16, 19, 30)
+local CARD = Color3.fromRGB(27, 32, 49)
+local ACCENT = Color3.fromRGB(121, 94, 253)
+local MUTED = Color3.fromRGB(161, 169, 190)
+local WHITE = Color3.fromRGB(242, 243, 250)
+local GREEN = Color3.fromRGB(77, 213, 157)
+
+local function corner(parent, radius)
+    local x = Instance.new("UICorner")
+    x.CornerRadius = UDim.new(0, radius or 9)
+    x.Parent = parent
+    return x
+end
+local function stroke(parent, color)
+    local x = Instance.new("UIStroke")
+    x.Color = color or Color3.fromRGB(56, 63, 88)
+    x.Transparency = 0.35
+    x.Thickness = 1
+    x.Parent = parent
+    return x
+end
+local function text(parent, str, size, color, bold)
+    local x = Instance.new("TextLabel")
+    x.BackgroundTransparency = 1
+    x.Text = str
+    x.Font = bold and Enum.Font.GothamBold or Enum.Font.Gotham
+    x.TextColor3 = color or WHITE
+    x.TextSize = size or 14
+    x.TextWrapped = true
+    x.TextXAlignment = Enum.TextXAlignment.Left
+    x.Parent = parent
+    return x
+end
+local function button(parent, str, size)
+    local b = Instance.new("TextButton")
+    b.BackgroundColor3 = CARD
+    b.AutoButtonColor = true
+    b.TextColor3 = WHITE
+    b.Font = Enum.Font.GothamMedium
+    b.TextSize = size or 13
+    b.Text = str
+    b.Parent = parent
+    corner(b, 9)
+    return b
+end
+
+local bubble = button(mainGui, "S", 22)
+bubble.Size = UDim2.fromOffset(50, 50)
+bubble.Position = UDim2.new(0, 14, 0.48, 0)
+bubble.BackgroundColor3 = ACCENT
+bubble.Visible = false
+stroke(bubble, Color3.fromRGB(183, 165, 255))
+
+local panel = Instance.new("Frame")
+panel.Name = "Panel"
+panel.Size = UDim2.new(0, 326, 0, 426)
+panel.AnchorPoint = Vector2.new(0.5, 0.5)
+panel.Position = UDim2.new(0.5, 0, 0.5, 0)
+panel.BackgroundColor3 = BG
+panel.BorderSizePixel = 0
+panel.ClipsDescendants = true
+panel.Parent = mainGui
+corner(panel, 14)
+stroke(panel)
+
+local titleBar = Instance.new("Frame")
+titleBar.Size = UDim2.new(1, 0, 0, 55)
+titleBar.BackgroundColor3 = Color3.fromRGB(23, 26, 42)
+titleBar.BorderSizePixel = 0
+titleBar.Parent = panel
+local titleText = text(titleBar, "SINNT HUB", 18, WHITE, true)
+titleText.Size = UDim2.new(1, -78, 0, 26)
+titleText.Position = UDim2.fromOffset(16, 6)
+local subtitle = text(titleBar, "V1  •  NO KEY  •  MOBILE", 10, MUTED)
+subtitle.Size = UDim2.new(1, -82, 0, 16)
+subtitle.Position = UDim2.fromOffset(16, 31)
+local closeBtn = button(titleBar, "−", 23)
+closeBtn.Size = UDim2.fromOffset(36, 34)
+closeBtn.Position = UDim2.new(1, -46, 0, 10)
+closeBtn.BackgroundColor3 = Color3.fromRGB(51, 55, 79)
+
+local tabFrame = Instance.new("Frame")
+tabFrame.BackgroundTransparency = 1
+tabFrame.Position = UDim2.fromOffset(10, 62)
+tabFrame.Size = UDim2.new(1, -20, 0, 38)
+tabFrame.Parent = panel
+local tabLayout = Instance.new("UIListLayout")
+tabLayout.FillDirection = Enum.FillDirection.Horizontal
+tabLayout.Padding = UDim.new(0, 6)
+tabLayout.Parent = tabFrame
+local scroll = Instance.new("ScrollingFrame")
+scroll.Position = UDim2.fromOffset(10, 107)
+scroll.Size = UDim2.new(1, -20, 1, -145)
+scroll.BackgroundTransparency = 1
+scroll.ScrollBarThickness = 3
+scroll.ScrollBarImageColor3 = ACCENT
+scroll.BorderSizePixel = 0
+scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+scroll.Parent = panel
+local listLayout = Instance.new("UIListLayout")
+listLayout.SortOrder = Enum.SortOrder.LayoutOrder
+listLayout.Padding = UDim.new(0, 7)
+listLayout.Parent = scroll
+
+local status = text(panel, "Siap untuk pengujian.", 11, MUTED)
+status.Size = UDim2.new(1, -22, 0, 24)
+status.Position = UDim2.new(0, 11, 1, -32)
+status.TextTruncate = Enum.TextTruncate.AtEnd
+local function notice(message)
+    if alive then status.Text = tostring(message) end
+end
+
+local function draggable(frame, handle)
+    local dragging = false
+    local dragInput, dragStart, startPos
+    track(handle.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch or
+           input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = true
+            dragStart = input.Position
+            startPos = frame.Position
+            track(input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then dragging = false end
+            end))
+        end
+    end))
+    track(handle.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch or
+           input.UserInputType == Enum.UserInputType.MouseMovement then
+            dragInput = input
+        end
+    end))
+    track(UserInputService.InputChanged:Connect(function(input)
+        if dragging and input == dragInput then
+            local delta = input.Position - dragStart
+            frame.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y
+            )
+        end
+    end))
+end
+draggable(panel, titleBar)
+draggable(bubble, bubble)
+track(closeBtn.Activated:Connect(function()
+    panel.Visible = false
+    bubble.Visible = true
+end))
+track(bubble.Activated:Connect(function()
+    panel.Visible = true
+    bubble.Visible = false
+end))
+
+local currentTab = "Home"
+local tabs = {}
+local renderTab
+for _, name in ipairs({"Home", "Player", "ESP", "Tools"}) do
+    local b = button(tabFrame, name, 12)
+    b.Size = UDim2.new(0, name == "Player" and 79 or 70, 1, 0)
+    tabs[name] = b
+    track(b.Activated:Connect(function()
+        currentTab = name
+        renderTab()
+    end))
+end
+local function cleanPage()
+    for _, conn in ipairs(pageConnections) do
+        pcall(function() conn:Disconnect() end)
+    end
+    table.clear(pageConnections)
+    for _, item in ipairs(scroll:GetChildren()) do
+        if item ~= listLayout then item:Destroy() end
+    end
+    scroll.CanvasPosition = Vector2.new(0, 0)
+end
+local function heading(t)
+    local x = text(scroll, t, 12, MUTED, true)
+    x.Size = UDim2.new(1, -10, 0, 25)
+    return x
+end
+local function paragraph(s, height)
+    local f = Instance.new("Frame")
+    f.Size = UDim2.new(1, -5, 0, height or 59)
+    f.BackgroundColor3 = CARD
+    f.Parent = scroll
+    corner(f)
+    local x = text(f, s, 12, WHITE)
+    x.Size = UDim2.new(1, -24, 1, -12)
+    x.Position = UDim2.fromOffset(12, 6)
+    return f
+end
+local featureChanged
+local function toggleRow(title, desc, key)
+    local f = Instance.new("Frame")
+    f.Size = UDim2.new(1, -5, 0, 64)
+    f.BackgroundColor3 = CARD
+    f.Parent = scroll
+    corner(f)
+    local nameLabel = text(f, title, 13, WHITE, true)
+    nameLabel.Position = UDim2.fromOffset(12, 8)
+    nameLabel.Size = UDim2.new(1, -98, 0, 20)
+    local descLabel = text(f, desc, 10, MUTED)
+    descLabel.Position = UDim2.fromOffset(12, 31)
+    descLabel.Size = UDim2.new(1, -100, 0, 23)
+    local b = button(f, "", 11)
+    b.Position = UDim2.new(1, -83, 0, 15)
+    b.Size = UDim2.fromOffset(70, 34)
+    local function refresh()
+        b.Text = state[key] and "ON" or "OFF"
+        b.BackgroundColor3 = state[key] and Color3.fromRGB(36, 104, 78) or Color3.fromRGB(64, 69, 89)
+        b.TextColor3 = state[key] and GREEN or WHITE
+    end
+    refresh()
+    trackPage(b.Activated:Connect(function()
+        state[key] = not state[key]
+        featureChanged(key)
+        saveSettings()
+        refresh()
+        notice(title .. (state[key] and ": ON" or ": OFF"))
+    end))
+end
+local function actionRow(title, desc, callback)
+    local f = Instance.new("Frame")
+    f.Size = UDim2.new(1, -5, 0, 62)
+    f.BackgroundColor3 = CARD
+    f.Parent = scroll
+    corner(f)
+    local a = text(f, title, 13, WHITE, true)
+    a.Position = UDim2.fromOffset(12, 8)
+    a.Size = UDim2.new(1, -95, 0, 20)
+    local d = text(f, desc, 10, MUTED)
+    d.Position = UDim2.fromOffset(12, 30)
+    d.Size = UDim2.new(1, -105, 0, 25)
+    local b = button(f, "JALANKAN", 10)
+    b.BackgroundColor3 = ACCENT
+    b.Position = UDim2.new(1, -92, 0, 15)
+    b.Size = UDim2.fromOffset(80, 32)
+    trackPage(b.Activated:Connect(function()
+        local ok, msg = pcall(callback)
+        if not ok then notice("Error: " .. tostring(msg)) end
+    end))
+end
+
+featureChanged = function(key)
+    if key == "speed" or key == "jump" then applyMovement() end
+    if key == "noclip" and not state.noclip then restoreCollisions() end
+    if key == "playerESP" then refreshPlayerVisuals() end
+    if key == "eggESP" then refreshEggVisuals() end
+    if key == "fpsSaver" then applyFpsSaver() end
+end
+
+local function teleportToEgg()
+    local egg, target = findNearestEgg()
+    local root = rootPart()
+    if not root then notice("Karakter belum siap.") return end
+    if not egg or not target then notice("Objek bernama Egg/Telur tidak ditemukan.") return end
+    local ok = pcall(function()
+        root.CFrame = CFrame.new(target.Position + Vector3.new(0, 4, 0))
+    end)
+    notice(ok and ("Percobaan teleport: " .. egg.Name) or "Teleport ditolak oleh client.")
+end
+local function fireNearestPrompt()
+    if type(fireproximityprompt) ~= "function" then
+        notice("Executor tidak menyediakan fireproximityprompt.")
+        return
+    end
+    local root = rootPart()
+    if not root then notice("Karakter belum siap.") return end
+    local bestPrompt, bestDist = nil, 12
+    for _, inst in ipairs(Workspace:GetDescendants()) do
+        if inst:IsA("ProximityPrompt") and inst.Enabled then
+            local p = inst.Parent
+            if p and p:IsA("Attachment") then p = p.Parent end
+            if p and p:IsA("BasePart") then
+                local dist = (p.Position - root.Position).Magnitude
+                if dist < bestDist then bestPrompt, bestDist = inst, dist end
+            end
+        end
+    end
+    if not bestPrompt then notice("Tidak ada ProximityPrompt di radius 12 studs.") return end
+    local ok, err = pcall(function() fireproximityprompt(bestPrompt) end)
+    notice(ok and "Prompt lokal dicoba dijalankan." or ("Prompt gagal: " .. tostring(err)))
+end
+local function resetAll()
+    for key in pairs(state) do state[key] = false end
+    applyMovement()
+    restoreCollisions()
+    refreshPlayerVisuals()
+    refreshEggVisuals()
+    restoreVisuals()
+    saveSettings()
+    renderTab()
+    notice("Semua fitur dimatikan.")
+end
+
+local destroyHub
+renderTab = function()
+    if not alive then return end
+    cleanPage()
+    for name, b in pairs(tabs) do
+        b.BackgroundColor3 = name == currentTab and ACCENT or CARD
+    end
+    if currentTab == "Home" then
+        heading("BUILD PRIBADI • TANPA KEY")
+        paragraph("SINNT HUB V1 dibuat mandiri. Tidak memakai HttpGet, loadstring eksternal, iklan, trial, atau sistem key.", 78)
+        paragraph("Fitur yang mengubah gerakan atau lokasi bersifat client-side. Server Roblox bisa menolak atau mengembalikan perubahan.", 70)
+        heading("INFO")
+        paragraph("Delta APK yang diperiksa: 2.743.1136 (ARM64). Kompatibilitas aktual perlu diuji pada perangkat.", 68)
+    elseif currentTab == "Player" then
+        heading("PENGATURAN KARAKTER")
+        toggleRow("Speed Boost", "WalkSpeed menjadi 32", "speed")
+        toggleRow("Jump Boost", "JumpPower menjadi 85", "jump")
+        toggleRow("Infinite Jump", "Tekan jump berulang saat di udara", "infiniteJump")
+        toggleRow("Noclip", "Lewat objek dari sisi client", "noclip")
+    elseif currentTab == "ESP" then
+        heading("PENANDA VISUAL")
+        toggleRow("Player ESP", "Nama dan outline karakter lain", "playerESP")
+        toggleRow("Egg ESP", "Deteksi nama objek Egg atau Telur", "eggESP")
+        actionRow("Nearest Egg", "Coba berpindah ke Egg terdekat", teleportToEgg)
+        paragraph("Pendeteksi Egg berbasis nama objek. Kalau game memakai nama internal berbeda, objek tidak akan terdeteksi.", 73)
+    elseif currentTab == "Tools" then
+        heading("UTILITAS")
+        toggleRow("Anti AFK", "Kirim input idle saat terdeteksi", "antiAFK")
+        toggleRow("FPS Saver", "Kurangi efek visual client", "fpsSaver")
+        actionRow("Interaksi Prompt", "Coba prompt terdekat; butuh API executor", fireNearestPrompt)
+        actionRow("Reset Fitur", "Kembalikan setelan hub", resetAll)
+        actionRow("Hapus Hub", "Tutup dan bersihkan semua marker", function()
+            destroyHub()
+        end)
+    end
+end
+
+-- Event hooks are per execution, and all disconnected on Destroy().
+track(Players.PlayerAdded:Connect(function(plr)
+    track(plr.CharacterAdded:Connect(function()
+        task.wait(0.5)
+        addPlayerVisual(plr)
+    end))
+    if state.playerESP then addPlayerVisual(plr) end
+end))
+for _, plr in ipairs(Players:GetPlayers()) do
+    if plr ~= player then
+        track(plr.CharacterAdded:Connect(function()
+            task.wait(0.5)
+            addPlayerVisual(plr)
+        end))
+    end
+end
+track(Players.PlayerRemoving:Connect(function(plr)
+    deletePlayerVisual(plr)
+end))
+track(player.CharacterAdded:Connect(function()
+    restoreCollisions()
+    task.wait(0.35)
+    if alive then applyMovement() end
+end))
+track(UserInputService.JumpRequest:Connect(function()
+    if not alive or not state.infiniteJump then return end
+    local h = humanoid()
+    if h and h.Health > 0 then pcall(function() h:ChangeState(Enum.HumanoidStateType.Jumping) end) end
+end))
+track(Workspace.DescendantAdded:Connect(function(inst)
+    if not alive then return end
+    if state.eggESP and eggNamed(inst) then addEggVisual(inst) end
+    if state.fpsSaver and (inst:IsA("ParticleEmitter") or inst:IsA("Trail") or inst:IsA("Beam")) then
+        setVisual(inst, "Enabled", false)
+    end
+end))
+track(player.Idled:Connect(function()
+    if not alive or not state.antiAFK then return end
+    pcall(function()
+        local virtualUser = game:GetService("VirtualUser")
+        virtualUser:CaptureController()
+        virtualUser:ClickButton2(Vector2.new(0, 0))
+    end)
+end))
+local stepTime = 0
+track(RunService.Heartbeat:Connect(function(dt)
+    if not alive then return end
+    if state.noclip then applyNoclip() end
+    stepTime = stepTime + dt
+    if stepTime >= 0.55 then
+        stepTime = 0
+        if state.speed or state.jump then applyMovement() end
+        if state.playerESP then
+            local myRoot = rootPart()
+            if myRoot then
+                for plr, objects in pairs(playerVisuals) do
+                    local otherRoot = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
+                    local label = objects[3]
+                    if otherRoot and label and label.Parent then
+                        local distance = math.floor((otherRoot.Position - myRoot.Position).Magnitude)
+                        label.Text = plr.DisplayName .. " [" .. distance .. " studs]"
+                    end
+                end
+            end
+        end
+    end
+end))
+
+-- Ensure shutdown doesn't touch GUI or effects belonging to other scripts.
+destroyHub = function()
+    if not alive then return end
+    alive = false
+    for key in pairs(state) do state[key] = false end
+    applyMovement()
+    restoreCollisions()
+    refreshPlayerVisuals()
+    refreshEggVisuals()
+    restoreVisuals()
+    for _, conn in ipairs(pageConnections) do
+        pcall(function() conn:Disconnect() end)
+    end
+    table.clear(pageConnections)
+    for _, conn in ipairs(connections) do
+        pcall(function() conn:Disconnect() end)
+    end
+    table.clear(connections)
+    if mainGui and mainGui.Parent then mainGui:Destroy() end
+    if env.SINNT_HUB_V1 and env.SINNT_HUB_V1.Destroy == destroyHub then
+        env.SINNT_HUB_V1 = nil
+    end
+end
+env.SINNT_HUB_V1 = {Destroy = destroyHub, Version = "1.0.0"}
+
+applyMovement()
+if state.fpsSaver then applyFpsSaver() end
+if state.playerESP then refreshPlayerVisuals() end
+if state.eggESP then refreshEggVisuals() end
+renderTab()
+notice("SINNT HUB V1 aktif • tanpa key.")
